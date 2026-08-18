@@ -78,6 +78,11 @@ The exploitation vectors are:
     - tested and working against multiple java applications, platforms, etc, via servlets that process serialized objets (e.g. when you see an "Invoker" in a link)
 * Apache Struts2 CVE-2017-5638
     - tested in Apache Struts 2 applications
+* Log4Shell / JNDI Injection (CVE-2021-44228, CVE-2021-45046)
+    - active out-of-band detection: injects JNDI payloads (with WAF-bypass variants) into commonly logged
+      HTTP headers and the query string, using a unique token per injection point
+    - a built-in TCP listener can auto-confirm the callback and pinpoint the exact vulnerable header,
+      or you can use an external collaborator (Burp Collaborator, interactsh, canarytokens, your own DNS)
 * Others
 
 Videos
@@ -176,6 +181,22 @@ $ python jexboss.py -u http://vulnerable_java_struts2_app/page.action --struts2
 ```
 $ python jexboss.py -u http://vulnerable_java_struts2_app/page.action --struts2 --cookies "JSESSIONID=24517D9075136F202DCE20E9C89D424D"
 ```
+
+* For Log4Shell / JNDI Injection (CVE-2021-44228) using the built-in listener (auto-confirms the callback
+and shows which header is vulnerable). `--log4shell-listen-ip` must be an address reachable from the target
+(same as when you set up a reverse shell):
+```
+$ python jexboss.py -u http://vulnerable_java_app/ --log4shell --log4shell-listen --log4shell-listen-ip YOUR_REACHABLE_IP
+```
+
+* For Log4Shell using an external out-of-band service (Burp Collaborator, interactsh, canarytokens or your
+own authoritative DNS). A unique token is injected per point, so you can tell exactly which one fired:
+```
+$ python jexboss.py -u http://vulnerable_java_app/ --log4shell --log4shell-callback YOUR_OOB_DOMAIN
+```
+
+> Note: this module performs **detection only** — it does not serve a malicious class from a rogue LDAP/RMI
+> server. Only use it against systems you have explicit permission to test.
 
 * Auto scan mode:
 ```
